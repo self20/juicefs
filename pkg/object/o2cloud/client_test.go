@@ -19,6 +19,7 @@ package o2cloud
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -116,6 +117,65 @@ func TestO2AmbiguousUploadIsNotRepeated(t *testing.T) {
 	}
 	if requests != 1 || item.ID != "99" {
 		t.Fatalf("uploads=%d ID=%s", requests, item.ID)
+	}
+}
+
+func TestO2CloudFront403RetriesWithoutSessionRenewal(t *testing.T) {
+	requests := 0
+	c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/media/folder/root" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return
+		}
+		requests++
+		if requests == 1 {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, "The request could not be satisfied. Request blocked by CloudFront.")
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"folders":[{"id":10,"name":"root"}]}}`)
+	})
+	root, err := c.Root(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.ID != "10" || requests != 2 {
+		t.Fatalf("root ID %s after %d requests", root.ID, requests)
+	}
+}
+
+func TestO2CloudFront403DuringRenewalIsTemporary(t *testing.T) {
+	c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/login/oauth" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "The request could not be satisfied by CloudFront.")
+	})
+	c.session.OAuthBundle = "test-bundle"
+	var block cloudFrontBlockError
+	if err := c.renew(context.Background(), c.session); !errors.As(err, &block) {
+		t.Fatalf("renewal error: %v", err)
+	}
+}
+
+func TestO2CloudFront403DoesNotRepeatMutation(t *testing.T) {
+	requests := 0
+	c := mockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, "The request could not be satisfied by CloudFront.")
+	})
+	var block cloudFrontBlockError
+	if _, err := c.request(context.Background(), http.MethodPost, "media", nil, []byte(`{}`)); !errors.As(err, &block) {
+		t.Fatalf("mutation error: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("mutation sent %d times", requests)
 	}
 }
 

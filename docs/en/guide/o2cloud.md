@@ -34,6 +34,8 @@ are confirmed by ID. Nonempty folders are not deleted.
 `O2CLOUD_TPS` limits request rate across one storage client (default: 2).
 `O2CLOUD_RETRIES` sets the number of retries for read-only API requests
 (default: 3). Mutating requests are never blindly retried.
+An HTML 403 page identifying a CloudFront request block is treated as a
+temporary failure rather than proof that the O2 session expired.
 Upload confirmation can take about two minutes when O2's listings lag. For
 mounts on a slow account, set `--put-timeout 300s`. Set `O2CLOUD_JOURNAL_DIR`
 to an absolute, persistent directory outside the repository, dedicated to this

@@ -228,6 +228,10 @@ func (c *Client) renew(ctx context.Context, expired Session) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if isCloudFrontBlock(resp, preview) {
+			return cloudFrontBlockError{}
+		}
 		return statusError{resp.StatusCode}
 	}
 	var payload map[string]any
@@ -341,7 +345,27 @@ func (c *Client) originHeaders(req *http.Request) {
 type statusError struct{ code int }
 
 func (e statusError) Error() string { return fmt.Sprintf("O2 Cloud HTTP %d", e.code) }
+
+type cloudFrontBlockError struct{}
+
+func (cloudFrontBlockError) Error() string {
+	return "O2 Cloud CloudFront temporarily blocked the request"
+}
+
+func isCloudFrontBlock(resp *http.Response, body []byte) bool {
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+		return false
+	}
+	message := strings.ToLower(string(body))
+	return strings.Contains(message, "cloudfront") || strings.Contains(message, "request blocked") ||
+		strings.Contains(message, "request could not be satisfied")
+}
+
 func retryable(err error) bool {
+	var block cloudFrontBlockError
+	if errors.As(err, &block) {
+		return true
+	}
 	var status statusError
 	if errors.As(err, &status) {
 		return status.code == 408 || status.code == 429 || status.code >= 500
@@ -387,16 +411,19 @@ func (c *Client) request(ctx context.Context, method, resource string, params ur
 		resp, err := c.http.Do(req)
 		if err == nil {
 			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				preview, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 				resp.Body.Close()
-				if readOnly && attempt == 0 {
+				if isCloudFrontBlock(resp, preview) {
+					err = cloudFrontBlockError{}
+				} else if readOnly && attempt == 0 {
 					if renewErr := c.renew(ctx, session); renewErr != nil {
 						return nil, renewErr
 					}
 					continue
+				} else {
+					return nil, statusError{resp.StatusCode}
 				}
-				return nil, statusError{resp.StatusCode}
-			}
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				err = statusError{resp.StatusCode}
 				resp.Body.Close()
 			} else {
