@@ -142,6 +142,8 @@ func TestO2PutUsesRecentID(t *testing.T) {
 }
 
 func TestO2PutDoesNotResendUnconfirmedUpload(t *testing.T) {
+	journalDir := t.TempDir()
+	t.Setenv("O2CLOUD_JOURNAL_DIR", journalDir)
 	sessionFile := filepath.Join(t.TempDir(), "session.json")
 	if err := os.WriteFile(sessionFile, []byte(`{"validationKey":"test"}`), 0600); err != nil {
 		t.Fatal(err)
@@ -185,11 +187,28 @@ func TestO2PutDoesNotResendUnconfirmedUpload(t *testing.T) {
 	if uploads != 1 {
 		t.Fatalf("sent %d uploads for one key", uploads)
 	}
+	entries, err := os.ReadDir(journalDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("pending journal entries: %d, %v", len(entries), err)
+	}
+	restarted := &o2Storage{client: client, rootID: "10"}
+	restartCtx, restartCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer restartCancel()
+	if err := restarted.Put(restartCtx, "block", strings.NewReader("data")); err == nil || !strings.Contains(err.Error(), "refusing to resend") {
+		t.Fatalf("Put after restart: %v", err)
+	}
+	if uploads != 1 {
+		t.Fatalf("sent %d uploads after restart", uploads)
+	}
 	visible.Store(true)
-	if err := s.Put(context.Background(), "block", strings.NewReader("data")); err != nil {
+	if err := restarted.Put(context.Background(), "block", strings.NewReader("data")); err != nil {
 		t.Fatalf("reconcile visible upload: %v", err)
 	}
 	if uploads != 1 {
 		t.Fatalf("sent %d uploads after reconciliation", uploads)
+	}
+	entries, err = os.ReadDir(journalDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("journal after reconciliation: %d entries, %v", len(entries), err)
 	}
 }

@@ -35,10 +35,15 @@ are confirmed by ID. Nonempty folders are not deleted.
 `O2CLOUD_RETRIES` sets the number of retries for read-only API requests
 (default: 3). Mutating requests are never blindly retried.
 Upload confirmation can take about two minutes when O2's listings lag. For
-mounts on a slow account, set `--put-timeout 300s`. If an upload is still
-unconfirmed, the running client refuses to resend the same key until it can
-verify an identical object. Stop and inspect the volume after such an error;
-this in-memory guard does not survive a client restart.
+mounts on a slow account, set `--put-timeout 300s`. Set `O2CLOUD_JOURNAL_DIR`
+to an absolute, persistent directory outside the repository, dedicated to this
+account and endpoint. The backend records each upload intent there before
+sending data. After a restart, it refuses to resend an unconfirmed key until
+it can verify an identical object. The journal contains object keys and sizes,
+but no credentials. Keep it available to every process that may write to the
+same endpoint. Without this directory, the guard only lasts until the client
+exits. Stop and inspect the volume after an unconfirmed upload; do not discard
+the journal to force a retry.
 `O2CLOUD_API_URL` and `O2CLOUD_UPLOAD_URL` are intended only for local mock
 tests. Uploads spool to private temporary files and support a single object up
 to 1 GiB. Uploads above 200 MiB use O2's asynchronous upload mode. Multipart

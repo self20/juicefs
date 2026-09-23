@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +45,116 @@ type o2Storage struct {
 	recent   map[string]o2.Item
 	pending  map[string]bool
 	folders  map[string]o2.Item
+}
+
+func (s *o2Storage) pendingPath(key string) (string, error) {
+	dir := os.Getenv("O2CLOUD_JOURNAL_DIR")
+	if dir == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(dir) {
+		return "", errors.New("O2CLOUD_JOURNAL_DIR must be an absolute path")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create O2 upload journal: %w", err)
+	}
+	id := sha256.Sum256([]byte(s.rootID + "\x00" + key))
+	return filepath.Join(dir, fmt.Sprintf("%x.pending", id)), nil
+}
+
+func syncO2JournalDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	file, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
+}
+
+func (s *o2Storage) hasPending(key string) (bool, error) {
+	s.mu.Lock()
+	pending := s.pending[key]
+	s.mu.Unlock()
+	if pending {
+		return true, nil
+	}
+	path, err := s.pendingPath(key)
+	if err != nil || path == "" {
+		return false, err
+	}
+	_, err = os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (s *o2Storage) reservePending(key string, size int64) error {
+	if pending, err := s.hasPending(key); err != nil {
+		return err
+	} else if pending {
+		return fmt.Errorf("O2 upload of %q is unconfirmed; refusing to resend", key)
+	}
+	path, err := s.pendingPath(key)
+	if err != nil {
+		return err
+	}
+	if path != "" {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("O2 upload of %q is unconfirmed; refusing to resend", key)
+		}
+		if err != nil {
+			return fmt.Errorf("reserve O2 upload %q: %w", key, err)
+		}
+		_, writeErr := fmt.Fprintf(file, "%s\n%d\n", key, size)
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		closeErr := file.Close()
+		if writeErr != nil || closeErr != nil {
+			_ = os.Remove(path)
+			return fmt.Errorf("persist O2 upload intent %q: %v %v", key, writeErr, closeErr)
+		}
+		if err = syncO2JournalDir(filepath.Dir(path)); err != nil {
+			_ = os.Remove(path)
+			return fmt.Errorf("sync O2 upload journal: %w", err)
+		}
+	}
+	s.mu.Lock()
+	if s.pending == nil {
+		s.pending = make(map[string]bool)
+	}
+	s.pending[key] = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *o2Storage) clearPending(key string) error {
+	path, err := s.pendingPath(key)
+	if err != nil {
+		return err
+	}
+	if path != "" {
+		if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("clear O2 upload intent %q: %w", key, err)
+		}
+		if err == nil {
+			if err = syncO2JournalDir(filepath.Dir(path)); err != nil {
+				return fmt.Errorf("sync O2 upload journal: %w", err)
+			}
+		}
+	}
+	s.mu.Lock()
+	delete(s.pending, key)
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *o2Storage) String() string { return "o2cloud://" + s.rootName + "/" }
@@ -230,24 +342,14 @@ func (s *o2Storage) Put(ctx context.Context, key string, in io.Reader, getters .
 			return closeErr
 		}
 		if remoteSize == size && string(remoteHash.Sum(nil)) == string(localHash.Sum(nil)) {
-			s.mu.Lock()
-			delete(s.pending, key)
-			s.mu.Unlock()
-			return nil
+			return s.clearPending(key)
 		}
 		return fmt.Errorf("O2 key %q already exists with different content", key)
 	}
-	s.mu.Lock()
-	if s.pending[key] {
-		s.mu.Unlock()
-		return fmt.Errorf("O2 upload of %q is unconfirmed; refusing to resend", key)
-	}
-	if s.pending == nil {
-		s.pending = make(map[string]bool)
-	}
-	s.pending[key] = true
-	s.mu.Unlock()
 	if _, err = tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err = s.reservePending(key, size); err != nil {
 		return err
 	}
 	item, err = s.client.Upload(ctx, parent, parts[len(parts)-1], tmp, size)
@@ -259,9 +361,8 @@ func (s *o2Storage) Put(ctx context.Context, key string, in io.Reader, getters .
 		s.recent = make(map[string]o2.Item)
 	}
 	s.recent[key] = item
-	delete(s.pending, key)
 	s.mu.Unlock()
-	return nil
+	return s.clearPending(key)
 }
 
 func (s *o2Storage) Delete(ctx context.Context, key string, getters ...AttrGetter) error {
@@ -270,9 +371,10 @@ func (s *o2Storage) Delete(ctx context.Context, key string, getters ...AttrGette
 	defer lock.Unlock()
 	item, err := s.find(ctx, key)
 	if errors.Is(err, os.ErrNotExist) {
-		s.mu.Lock()
-		pending := s.pending[key]
-		s.mu.Unlock()
+		pending, pendingErr := s.hasPending(key)
+		if pendingErr != nil {
+			return pendingErr
+		}
 		if pending {
 			return fmt.Errorf("O2 upload of %q is unconfirmed; refusing to delete by name", key)
 		}
@@ -286,10 +388,9 @@ func (s *o2Storage) Delete(ctx context.Context, key string, getters ...AttrGette
 	}
 	s.mu.Lock()
 	delete(s.recent, key)
-	delete(s.pending, key)
 	delete(s.folders, key)
 	s.mu.Unlock()
-	return nil
+	return s.clearPending(key)
 }
 
 func (s *o2Storage) recentObjects() []Object {
